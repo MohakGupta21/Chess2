@@ -5,12 +5,15 @@ serves the API under `/api` **and** serves the built React client
 ([client/dist](./client)) as static files with SPA fallback
 (see [server/src/app.ts](./server/src/app.ts)).
 
-Deploy it as a single Node process. Do **not** split the client and server onto
-two origins unless you also rework auth — the browser calls `/api/...`
-*relative* to its own origin ([client/src/api/client.ts](./client/src/api/client.ts))
-and the session cookie is `httpOnly; SameSite=Lax; Secure`
-([server/src/auth.ts](./server/src/auth.ts#L34-L38)), which only works cleanly
-same‑origin over HTTPS.
+The simplest deploy is a single Node process. It **can** also be split with the
+client on a static host and the server elsewhere — see
+["Split (cross‑origin) deploy"](#split-cross-origin-deploy) below.
+
+By default the browser calls `/api/...` *relative* to its own origin
+([client/src/api/client.ts](./client/src/api/client.ts)) and the session cookie
+is `httpOnly; SameSite=Lax; Secure`
+([server/src/auth.ts](./server/src/auth.ts#L34-L38)), which works cleanly
+same‑origin over HTTPS with no extra configuration.
 
 No Docker is used anywhere below.
 
@@ -43,7 +46,36 @@ Set these on the server process (defaults from [server/src/config.ts](./server/s
 | `DB_PATH` | yes | absolute path on the persistent disk, e.g. `/var/lib/chess/chess.sqlite` | parent dir is created automatically; WAL mode is on |
 | `PORT` | no | port to listen on (default `4000`) | many PaaS platforms inject this |
 | `TRUST_PROXY` | if behind a proxy/load balancer | `1` (single proxy hop) or `true` | so the rate limiter keys on the real client IP, not the proxy |
-| `CLIENT_ORIGIN` | no (single‑origin) | — | only matters if you serve the UI from a different origin; then set it to that origin for CORS |
+| `CLIENT_ORIGIN` | only for a split deploy | the client's origin, e.g. `https://chess.example.com` | reflected by CORS so the browser accepts credentialed cross‑origin API calls |
+| `COOKIE_SAMESITE` | only for a split deploy | `none` | lets the browser send the auth cookie on cross‑site requests; forces `Secure` on, so the API must be HTTPS |
+| `COOKIE_SECURE` | no | `1` | force the `Secure` cookie flag outside production (rarely needed) |
+
+---
+
+## 2a. Split (cross‑origin) deploy
+
+To host the built client (`client/dist`) on a static/CDN host and the API on a
+separate origin:
+
+**Client** — build with the API's base URL baked in (Vite reads `VITE_*` at
+build time; see [client/.env.example](./client/.env.example)):
+
+```bash
+VITE_API_BASE_URL="https://chess-api.example.com" npm run build --workspace client
+```
+
+Deploy `client/dist` as static files with SPA fallback (rewrite unknown paths to
+`/index.html`). Leave `CLIENT_DIST` **unset** on the server so it stays API‑only.
+
+**Server** — set, in addition to the section 2 vars:
+
+| Var | Set it to |
+|---|---|
+| `CLIENT_ORIGIN` | the client's origin, e.g. `https://chess.example.com` |
+| `COOKIE_SAMESITE` | `none` |
+
+Both origins must be HTTPS. With `VITE_API_BASE_URL` unset the build is
+byte‑for‑byte the same‑origin bundle, so the single‑origin deploy is unaffected.
 
 ---
 

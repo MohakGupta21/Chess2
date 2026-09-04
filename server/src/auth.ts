@@ -33,8 +33,8 @@ function setAuthCookie(res: Response, userId: string): void {
   });
   res.cookie(config.cookieName, token, {
     httpOnly: true,
-    sameSite: "lax",
-    secure: config.isProd,
+    sameSite: config.cookieSameSite,
+    secure: config.cookieSecure,
     maxAge: config.tokenTtlSeconds * 1000,
     path: "/",
   });
@@ -144,7 +144,11 @@ authRouter.post(
 );
 
 authRouter.post("/signout", (_req: Request, res: Response) => {
-  res.clearCookie(config.cookieName, { path: "/" });
+  res.clearCookie(config.cookieName, {
+    path: "/",
+    sameSite: config.cookieSameSite,
+    secure: config.cookieSecure,
+  });
   res.status(204).end();
 });
 

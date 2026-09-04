@@ -47,6 +47,22 @@ export const config = {
       : randomBytes(32).toString("hex")),
   /** Auth cookie name. */
   cookieName: "chess_token",
+  /**
+   * `SameSite` attribute for the auth cookie. Defaults to `lax`, which is right
+   * for a same-origin deploy. For a split deploy (client and API on different
+   * origins) set `COOKIE_SAMESITE=none`; the browser then requires `Secure`,
+   * so also run the server in production over HTTPS (or set `COOKIE_SECURE=1`).
+   */
+  cookieSameSite: (() => {
+    const raw = (process.env.COOKIE_SAMESITE ?? "lax").toLowerCase();
+    return raw === "none" || raw === "strict" ? raw : "lax";
+  })() as "lax" | "none" | "strict",
+  /** `Secure` attribute for the auth cookie. On in production; forced on when
+   *  `SameSite=None` (browsers reject `None` without `Secure`). */
+  cookieSecure:
+    process.env.COOKIE_SECURE === "1" ||
+    isProd ||
+    (process.env.COOKIE_SAMESITE ?? "").toLowerCase() === "none",
   /** Session lifetime. */
   tokenTtlSeconds: 60 * 60 * 24 * 7,
   /** Allowed browser origin for CORS in dev (client Vite server). */

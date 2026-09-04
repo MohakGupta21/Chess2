@@ -23,15 +23,28 @@ export function setUnauthorizedHandler(fn: (() => void) | null) {
   onUnauthorized = fn;
 }
 
+// Base URL of the API server. Empty (the default) means "same origin": the
+// browser hits `/api/...` on whatever host served the app, which is how both
+// the single-origin production deploy and the Vite dev proxy work. Set
+// `VITE_API_BASE_URL` at build time (e.g. https://chess-api.example.com) to
+// point a separately-hosted client at a remote server.
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/+$/, "");
+
+// When the API lives on another origin the auth cookie is cross-site, so the
+// request has to opt in to sending credentials. Same-origin keeps the stricter
+// default. (Cross-origin also needs the server's `CLIENT_ORIGIN` set and its
+// auth cookie issued as `SameSite=None; Secure` — see DEPLOY.md.)
+const CREDENTIALS: RequestCredentials = API_BASE_URL ? "include" : "same-origin";
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body != null;
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE_URL}/api${path}`, {
     ...init,
     headers: {
       ...(hasBody ? { "Content-Type": "application/json" } : {}),
       ...(init?.headers ?? {}),
     },
-    credentials: "same-origin",
+    credentials: CREDENTIALS,
   });
 
   if (res.status === 401 && !path.startsWith("/auth/")) {
