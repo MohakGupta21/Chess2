@@ -1,0 +1,41 @@
+# Render Blueprint — one web service that serves BOTH the API and the built
+# client from a single origin (so the `SameSite=Lax` auth cookie works without
+# any CORS / cross-site changes). See DEPLOY.md "Option B — Managed platform".
+#
+# Apply: Render Dashboard → New → Blueprint → point at this repo.
+# After the first deploy, set JWT_SECRET's value once (see below) and keep it
+# stable — rotating it logs every user out.
+
+services:
+  - type: web
+    name: chess
+    runtime: node
+    # Disks require a paid instance type; the SQLite DB lives on the disk below
+    # and must survive restarts/redeploys, so the free tier will not work.
+    plan: starter
+    numInstances: 1 # single-writer SQLite — never scale past 1
+    buildCommand: npm ci && npm run build # builds server -> client (client/dist)
+    startCommand: npm start # node server/dist/index.js — does NOT rebuild
+    healthCheckPath: /api/health
+    # Node version is pinned by .node-version / "engines" at the repo root.
+    # Do NOT add a NODE_VERSION env var here — Node 24+ breaks the
+    # better-sqlite3 native binary and the server crashes on startup.
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        # Render generates a strong value on first deploy and keeps it stable
+        # across future deploys. To use your own: `openssl rand -hex 32`.
+        generateValue: true
+      - key: DB_PATH
+        value: /var/data/chess.sqlite # on the mounted disk below
+      - key: CLIENT_DIST
+        # Absolute path to the built client on Render's build host. Render checks
+        # out the repo at /opt/render/project/src.
+        value: /opt/render/project/src/client/dist
+      - key: TRUST_PROXY
+        value: "1" # one proxy hop (Render's LB) in front of the app
+    disk:
+      name: chess-data
+      mountPath: /var/data
+      sizeGB: 1

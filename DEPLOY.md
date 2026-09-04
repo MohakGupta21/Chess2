@@ -239,7 +239,17 @@ the SQLite file would be wiped on every restart.
 
 ### Render (example)
 
+> **Fastest path:** the repo ships a [`render.yaml`](./render.yaml) Blueprint that
+> encodes everything below (single web service serving API + client, disk, env
+> vars, health check, `numInstances: 1`). Render Dashboard → **New → Blueprint**,
+> point it at this repo, deploy. `JWT_SECRET` is auto-generated and kept stable;
+> the manual steps below are the equivalent if you'd rather click through it.
+
 1. **New → Web Service**, connect the repo. Runtime: **Node**.
+   - Node version is pinned to **22.x** via `.node-version` / `engines` (repo
+     root). Do **not** override it with a `NODE_VERSION` env var — Node 24+ has a
+     different native ABI and the `better-sqlite3` prebuild won't load, so the
+     server crashes on startup at `new Database()`.
 2. **Build command:** `npm ci && npm run build`
 3. **Start command:** `npm start`
 4. **Add a Disk:** mount path `/var/data`, ~1 GB.
