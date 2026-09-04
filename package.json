@@ -1,0 +1,21 @@
+{
+  "name": "chess-vs-computer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Sign in and play chess against a strong computer opponent. See AGENTS.md and PLAN.md.",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm run dev --workspace server",
+    "dev:client": "npm run dev --workspace client",
+    "build": "npm run build --workspace server && npm run build --workspace client",
+    "test": "npm run test --workspace server",
+    "start": "npm run start --workspace server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
