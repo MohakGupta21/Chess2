@@ -5,11 +5,9 @@ import { api } from "../api/client";
 interface Props {
   /** Change this (e.g. a counter) to force a re-fetch. */
   refreshKey?: number;
-  /** Highlight the signed-in player's row. */
-  meEmail?: string;
 }
 
-export function Leaderboard({ refreshKey = 0, meEmail }: Props) {
+export function Leaderboard({ refreshKey = 0 }: Props) {
   const [entries, setEntries] = useState<LeaderboardEntry[]>([]);
   const [error, setError] = useState(false);
 
@@ -35,10 +33,7 @@ export function Leaderboard({ refreshKey = 0, meEmail }: Props) {
       )}
       <div className="leaderboard">
         {entries.map((e, i) => (
-          <div
-            key={e.email}
-            className={e.email === meEmail ? "lb-row me" : "lb-row"}
-          >
+          <div key={i} className={e.isMe ? "lb-row me" : "lb-row"}>
             <span className="num">{i + 1}.</span>
             <span className="lb-email">{e.email}</span>
             <span className="lb-points">{e.points}</span>

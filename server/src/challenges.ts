@@ -6,10 +6,20 @@ import {
 } from "./shared.js";
 import { db, NOW_SQL, type ChallengeRow } from "./db.js";
 import { requireAuth, type AuthedRequest } from "./auth.js";
-import { createPvpGame, getGameForUser, toDTO } from "./games.js";
+import {
+  createPvpGame,
+  getGameForUser,
+  hasActivePvpGame,
+  toDTO,
+} from "./games.js";
 
-/** How long an accepted challenge keeps showing so the initiator can redirect. */
-const ACCEPTED_GRACE_MS = 60_000;
+/**
+ * How long an accepted challenge keeps showing so the initiator can redirect.
+ * Expressed as a `strftime` modifier so the "recently accepted" cutoff is
+ * computed by SQLite in the exact same format the `updated_at` column is
+ * stored in — no JS/SQL date-string format coupling.
+ */
+const ACCEPTED_GRACE = "-60 seconds";
 
 const findUserByEmail = db.prepare("SELECT id, email FROM users WHERE email = ?");
 const findUserById = db.prepare("SELECT id, email FROM users WHERE id = ?");
@@ -30,16 +40,19 @@ const acceptChallengeRow = db.prepare(
   `UPDATE challenges SET status = 'accepted', game_id = ?, updated_at = ${NOW_SQL}
      WHERE id = ?`,
 );
+const RECENT_CUTOFF = `strftime('%Y-%m-%dT%H:%M:%fZ','now','${ACCEPTED_GRACE}')`;
 const listIncoming = db.prepare(
   `SELECT * FROM challenges
      WHERE to_user_id = @u
-       AND (status = 'pending' OR (status = 'accepted' AND updated_at >= @since))
+       AND (status = 'pending'
+         OR (status = 'accepted' AND updated_at >= ${RECENT_CUTOFF}))
      ORDER BY created_at DESC`,
 );
 const listOutgoing = db.prepare(
   `SELECT * FROM challenges
      WHERE from_user_id = @u
-       AND (status = 'pending' OR (status = 'accepted' AND updated_at >= @since))
+       AND (status = 'pending'
+         OR (status = 'accepted' AND updated_at >= ${RECENT_CUTOFF}))
      ORDER BY created_at DESC`,
 );
 
@@ -101,10 +114,9 @@ challengesRouter.post("/", (req: AuthedRequest, res: Response) => {
 /** Pending challenges (plus just-accepted ones) for the current user. */
 challengesRouter.get("/", (req: AuthedRequest, res: Response) => {
   const u = req.user!.id;
-  const since = new Date(Date.now() - ACCEPTED_GRACE_MS).toISOString();
   res.json({
-    incoming: (listIncoming.all({ u, since }) as ChallengeRow[]).map(challengeToDTO),
-    outgoing: (listOutgoing.all({ u, since }) as ChallengeRow[]).map(challengeToDTO),
+    incoming: (listIncoming.all({ u }) as ChallengeRow[]).map(challengeToDTO),
+    outgoing: (listOutgoing.all({ u }) as ChallengeRow[]).map(challengeToDTO),
   });
 });
 
@@ -118,6 +130,18 @@ challengesRouter.post("/:id/accept", (req: AuthedRequest, res: Response) => {
   }
   if (row.status !== "pending") {
     res.status(409).json({ error: "challenge is no longer pending" });
+    return;
+  }
+  // Accepting abandons both players' active games; refuse if that would throw
+  // away an in-progress ranked game (and its points) for either side.
+  if (hasActivePvpGame(userId)) {
+    res.status(409).json({ error: "finish or resign your current game first" });
+    return;
+  }
+  if (hasActivePvpGame(row.from_user_id)) {
+    res
+      .status(409)
+      .json({ error: "that player is already in a game; try again later" });
     return;
   }
   const gameId = nanoid();

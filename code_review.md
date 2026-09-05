@@ -382,3 +382,364 @@ fires end-to-end via the API.
   timed-out partial results.
 - Clean separation: `shared` types, `EngineService`-style worker protocol so a
   real Stockfish build is a drop-in (per PLAN §13).
+
+---
+---
+
+# Review 2 — 2026-09-05 · database-focused comprehensive pass
+
+Review date: 2026-09-05. Requested scope: full codebase, **with particular
+attention to the database** (`server/src/db.ts` and every call site in
+`auth.ts`, `games.ts`, `challenges.ts`, `leaderboard.ts`). Context: since
+Review 1 the app gained pvp games + points, a SQLite disk on Render, and a
+split-origin deploy mode (`COOKIE_SAMESITE=none`, `VITE_API_BASE_URL`).
+
+Legend: **verified** = traced through the code and confirmed reachable;
+**plausible** = reasoned from the code, not executed. Line numbers approximate.
+
+Findings new in this pass are prefixed `DB-` (database), `SEC-` (security),
+`R-` (rules), `T-` (tests). They do not renumber Review 1.
+
+---
+
+## High — data integrity / competitive fairness
+
+### DB-H1 — End-of-game point transfer is not crash-safe and never reconciles — *verified (by inspection)*
+
+`games.ts` `/move` (L273–283) and `/resign` (L303–304) commit the finishing
+`UPDATE games SET status=… result=…` as one **autocommit** statement and *then*
+call `applyPvpResult()` as a **separate** `db.transaction`. There is no
+surrounding transaction and no reconciliation anywhere.
+
+If the process stops between the two writes — a Render redeploy sends `SIGTERM`
+mid-request; an unhandled throw; an OOM — the game is permanently
+`checkmate`/`resigned` with `points_applied = 0`, and **nothing ever retries**.
+`toDTO` reads the stored terminal status straight back, so the UI shows the game
+as finished; the winner never receives `+100`, the loser never spends `-25`.
+Over many games the leaderboard silently drifts.
+
+**Impact:** silent, permanent corruption of the one competitive feature; no
+error surfaced, no way to detect it after the fact without auditing rows.
+
+**Fix:** wrap the whole terminal path in a single `db.transaction` —
+`updateGame`/`finishGame` **and** `applyPvpResult` commit together or not at
+all. Cheap and total. Optionally add a read-time reconciler: when `toDTO` sees
+`status != 'active' && mode='pvp' && points_applied = 0`, apply the result then.
+
+### DB-H2 — A losing player can abandon a ranked game to dodge the loss — *verified (by inspection)*
+
+`POST /games` (new AI game) → `createAiGame` → `abandonActiveFor` (games.ts
+L35–39) runs:
+
+```sql
+UPDATE games SET status='abandoned'
+  WHERE status='active' AND (user_id=@u OR white_user_id=@u OR black_user_id=@u)
+```
+
+That matches an **in-progress pvp game** where the user is a player. `abandoned`
+games never pass through `applyPvpResult` (it is only called from `/move` and
+`/resign`), so **no points move**. The flow is reachable from the UI: while a
+ranked game is active, go to the Lobby (the "New game vs. Computer" button is
+always shown) and start an AI game — your pvp game flips to `abandoned`, the
+opponent sees "Game set aside", and the `-25` you were about to take evaporates.
+
+**Impact:** the ranked ladder is trivially gameable; an opponent who was winning
+gets nothing.
+
+**Fix:** in `createAiGame` / `abandonActiveFor`, refuse to abandon an active
+`mode='pvp'` row — either 409 ("finish or resign your current game first") or
+treat it as a resignation by the leaver (call the same path `/resign` uses,
+inside the transaction).
+
+---
+
+## Medium — schema management, robustness, durability
+
+### DB-M1 — `CHECK` constraints are never migrated; no schema versioning — *plausible*
+
+`addColumnIfMissing()` (db.ts L96–105) only ever emits
+`ALTER TABLE … ADD COLUMN`. SQLite **cannot** change a `CHECK` on an existing
+table without rebuilding it. So any database file created before `'abandoned'`
+was added to the `games.status` CHECK (or before `'pvp'` / the pvp columns) is
+still carrying the *old* constraints, and then:
+
+- `abandonActiveFor` writing `status='abandoned'` → `SQLITE_CONSTRAINT: CHECK`
+- `insertPvpGame` writing `mode='pvp'` → same
+
+There is no `PRAGMA user_version` (or any migrations table) to detect schema
+age, so this fails at runtime with a 500 rather than at startup.
+
+**Impact:** latent hard failure for any deployment whose `.sqlite` predates
+these features (i.e. an upgrade rather than a fresh disk). Fresh DBs are fine,
+which is why tests (`:memory:`, always current) don't catch it.
+
+**Fix:** add a tiny migration runner keyed on `PRAGMA user_version`. For the
+CHECK change specifically, do the standard rebuild inside one transaction:
+`CREATE TABLE games_new (… full current schema …)`, `INSERT INTO games_new
+SELECT …`, `DROP TABLE games`, `ALTER TABLE games_new RENAME TO games`, recreate
+indexes, bump `user_version`.
+
+### DB-M2 — "one active game per participant" has no DB constraint for the non-creator — *verified (by inspection)*
+
+`idx_games_one_active` is `UNIQUE(user_id) WHERE status='active'` — it only
+covers `user_id`, i.e. the **creator**. In a pvp game the opponent sits in
+`white_user_id` / `black_user_id`, which nothing constrains. The invariant holds
+today only because better-sqlite3 is synchronous and single-threaded and
+`createPvpGame` / `createAiGame` abandon the relevant players' active games
+first, inside a transaction. It breaks the instant there is a second process, an
+async driver, or a networked DB — the Render blueprint's `numInstances: 1` and
+the "never scale past 1" comment are the *only* things holding it.
+
+**Impact:** none now; a sharp edge for any future scaling. A concurrent
+double-accept (same opponent, two challenges) on a threaded stack would leave
+two active games for that opponent, and the "resume game" / `findActiveFor`
+`LIMIT 1` would then be non-deterministic.
+
+**Fix:** either (a) document `db.ts` as single-instance-only and add a
+start-up guard that refuses to run with a config implying >1 instance, or
+(b) model players in a `game_players(game_id, user_id, active)` table with a
+partial unique index on `(user_id) WHERE active`.
+
+### DB-M3 — timestamp filtering depends on an exact string format — *verified (by inspection)*
+
+`challenges.ts` L104 builds `since = new Date(Date.now() - GRACE).toISOString()`
+and the list queries compare `updated_at >= @since` as **text**. This only works
+because both sides are fixed-width UTC ISO-8601 with millisecond precision and a
+`Z` (`NOW_SQL` = `strftime('%Y-%m-%dT%H:%M:%fZ','now')`). Any row written another
+way — a manual `UPDATE`, a future column defaulted to `CURRENT_TIMESTAMP`
+(`YYYY-MM-DD HH:MM:SS`, a space, sorts *before* every `…T…` value), a different
+`strftime` mask — silently breaks the comparison: accepted challenges either
+vanish from the list immediately or linger forever.
+
+**Fix:** store timestamps as integer epoch-millis (or `strftime('%s','now')`)
+and compare numerically. If keeping ISO text, add a schema test that asserts the
+stored format and never introduce a second way to write a timestamp.
+
+### DB-M4 — no graceful shutdown, no WAL checkpoint — *verified (by inspection)*
+
+`db.ts` opens the connection at import (L15) and never closes it; there is no
+`SIGTERM` / `SIGINT` handler anywhere (`index.ts` is a bare `listen`). Every
+Render deploy kills the process with an open WAL. SQLite recovers the WAL on the
+next open, so this is not routine data loss — but the `-wal` file is never
+checkpointed on shutdown, so it only ever grows, and a host that swaps the
+filesystem out from under a killed process can lose the un-checkpointed tail.
+
+**Fix:** on `SIGTERM`/`SIGINT`: stop accepting connections, then
+`db.pragma('wal_checkpoint(TRUNCATE)')` and `db.close()`, then exit.
+
+### DB-M5 — no `busy_timeout` — *verified (by inspection)*
+
+`db.ts` sets `journal_mode=WAL` and `foreign_keys=ON` but not `busy_timeout`.
+While the app is the only connection this is invisible. The moment a second
+reader exists — a backup job, the `sqlite3` CLI, litestream, a future
+read-replica script — a write can throw `SQLITE_BUSY` *immediately* instead of
+waiting, surfacing as a random 500.
+
+**Fix:** `db.pragma('busy_timeout = 5000')` right after open.
+
+---
+
+## Low — hygiene, growth, minor correctness
+
+### DB-L1 — `markPointsApplied` doesn't touch `updated_at`
+
+`UPDATE games SET points_applied = 1 WHERE id = ?` (games.ts L59–61) is the only
+`games` write that doesn't also set `updated_at = ${NOW_SQL}`. After a pvp game's
+points post, `updated_at` no longer means "last modified". One-word fix.
+
+### DB-L2 — `users.email` uniqueness is case-sensitive at the DB level
+
+`UNIQUE(email)` with SQLite's default `BINARY` collation. Case-folding is done in
+app code in three places (`auth.ts` signup + signin, `challenges.ts`). A fourth
+path that forgets `.toLowerCase().trim()` would let `A@x.com` and `a@x.com`
+coexist. Fix: `email TEXT NOT NULL UNIQUE COLLATE NOCASE`.
+
+### DB-L3 — `challenges` rows are never deleted
+
+Declined / cancelled / accepted challenges live forever. Queries stay fast only
+because they filter on `status` and time. Add a periodic sweep (e.g. delete
+non-`pending` rows older than a day) or a startup cleanup.
+
+### DB-L4 — unbounded challenge creation
+
+Only a *pending pair* is de-duplicated (`pendingBetween`). One account can open
+pending challenges against unlimited distinct emails — table growth plus a
+low-grade nuisance vector. Consider a per-user cap on open outgoing challenges.
+
+### DB-L5 — `challengeToDTO` casts user rows with no null guard
+
+`challenges.ts` L54–55: `findUserById.get(...) as { email: string }` then
+`from.email`. Safe today only via `ON DELETE CASCADE` (delete a user → their
+challenges go too). `games.ts` `toDTO` handles the missing-opponent case;
+`challenges.ts` doesn't. Harmless unless a user row is ever removed by a path
+that bypasses cascade.
+
+### DB-L6 — full-row rewrite every half-move
+
+`updateGame` re-serialises and rewrites `moves`, `san` and `rep_counts` on every
+move — O(n) write per move, O(n²) bytes written per game. Negligible at chess
+game lengths; noted only so it isn't a surprise if move history is ever expanded.
+
+---
+
+## Security (non-DB)
+
+### SEC-M1 — no CSRF protection, and `COOKIE_SAMESITE=none` removes the only mitigation — *verified (by inspection)*
+
+Auth is a cookie the browser attaches automatically. No state-changing route
+(`POST /api/games`, `/games/:id/move`, `/challenges`, …) carries a CSRF token or
+checks `Origin`/`Referer`. With `SameSite=Lax` (single-origin deploy) cross-site
+sub-requests are blocked, so exposure is limited to top-level-navigation POSTs.
+With `SameSite=None` — the split-origin mode wired up in `config.ts` L56–65 and
+now documented in DEPLOY.md — **any website can drive the API as the logged-in
+user** (start games, spend the victim's move, spam challenges).
+
+**Fix:** on unsafe methods, verify `req.get('origin')` (or `referer`) is
+`config.clientOrigin`; or issue a double-submit CSRF token; or keep auth
+strictly same-origin and drop the `None` option.
+
+### SEC-M2 — no security headers
+
+`app.ts` wires CORS + `express.json` + `cookie-parser` only. No `helmet`, so no
+HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-Frame-Options` /
+frame-ancestors CSP on API responses or on the SPA served by `express.static`.
+The app is clickjackable and has no transport-security pinning.
+
+**Fix:** `app.use(helmet())`, with a CSP tuned for the built client.
+
+### SEC-M3 — raw email addresses exposed to every authenticated user
+
+`leaderboard.ts` returns the top-20 players' real emails; `games.ts` `toDTO`
+returns the opponent's email. That is PII disclosure to the whole user base and
+an account-enumeration aid.
+
+**Fix:** add a display name at signup and return that; or mask
+(`j•••@d•••.com`) anywhere the viewer isn't the owner.
+
+### SEC-L1 — JWT is unrevocable for its 7-day TTL
+
+`signout` only clears the cookie (`auth.ts` L146–153). A copied token stays valid
+for a week regardless. Acceptable for a hobby app; document, or shorten the TTL
+and add refresh, or track a per-user token version in `users`.
+
+### SEC-L2 — shared-IP rate-limit lockout
+
+`authLimiter` is `30 / 15 min` (prod) for signup **and** signin combined, keyed
+on IP. A campus / office NAT can lock out honest users. Consider also keying
+signin *failures* on the submitted email, and raising the per-IP ceiling.
+
+### SEC-L3 — only `/auth/*` is rate-limited
+
+A logged-in client can hammer `/games/:id/move` or `/challenges` freely. Impact
+is low (handlers are cheap, `express.json` capped at 16 kB) but a modest global
+limiter is cheap insurance.
+
+### SEC-L4 — production misconfig fails silently
+
+If `NODE_ENV=production` with **neither** `CLIENT_DIST` nor `CLIENT_ORIGIN` set
+(exactly the split-deploy case), CORS falls back to `http://localhost:5173` and
+every real browser call fails with an opaque "Failed to fetch" — the exact
+symptom hit during this project's deploy. Fix: in that env combination, log a
+loud warning at startup (or refuse to boot).
+
+---
+
+## Rules (minor deviations from FIDE, consistent with RULES.md §9)
+
+### R-L1 — threefold repetition and the fifty-move rule are applied automatically
+
+FIDE makes 3-fold and 50-move *claims* (only 5-fold / 75-move are automatic).
+`games.ts` L267 forces the draw at the 3rd occurrence; `chessRules.ts` L68
+forces it at halfmove clock 100. Matches RULES.md's stated intent; noted so the
+deviation is on record.
+
+### R-L2 — `repetitionKey` over-counts distinct positions
+
+`repetitionKey` (chessRules.ts L29–31) keeps FEN field 4, the en-passant target,
+which chess.js writes after *any* double pawn push even when no en-passant
+capture is actually available. Two otherwise-identical positions that differ only
+by a phantom EP square are treated as different, so a legitimate threefold can be
+delayed by up to one occurrence. Edge case; documented limitation.
+
+---
+
+## Test coverage gaps
+
+- **T-1** No test upgrades an older on-disk schema through `addColumnIfMissing`
+  (DB-M1) — the migration path is entirely unexercised.
+- **T-2** No test for abandoning an active pvp game to dodge points (DB-H2).
+- **T-3** No test simulates interruption between `updateGame` and
+  `applyPvpResult` (DB-H1), nor concurrent challenge accepts (DB-M2).
+- **T-4** No test asserts security headers, CSRF behaviour, or the CORS
+  fallback (SEC-M1/M2/L4).
+- **T-5** No test pins the stored timestamp format that DB-M3 depends on.
+
+---
+
+## What looks good (database)
+
+- **No SQL injection surface.** Every statement is a prepared statement with
+  bound params (named or positional); nothing is string-concatenated into SQL,
+  including `repetitionKey` output (it goes into JSON, not a query).
+- `foreign_keys = ON` is set on the connection, with sensible
+  `ON DELETE CASCADE` / `SET NULL` throughout.
+- The **happy-path** point transfer is correct: `applyPvpResult` is a
+  `db.transaction`, guarded by `points_applied`, so on a clean run it is
+  exactly-once and atomic (the crash gap is DB-H1, a separate concern).
+- The money-like invariant is enforced in SQL — `UPDATE users SET points =
+  MAX(0, points + ?)` — not a read-modify-write in JS.
+- Nested `db.transaction` (`acceptTxn` → `createPvpGame`) is safe:
+  better-sqlite3 promotes the inner one to a `SAVEPOINT`.
+- WAL + synchronous driver + `numInstances: 1` is a coherent single-writer
+  design for this scale; the constraints are written down in `render.yaml`.
+- Primary keys are `nanoid` (crypto RNG), not guessable sequential integers.
+- `requireAuth` re-reads the user row every request, so a deleted user's token
+  stops working immediately.
+
+---
+
+## Suggested order of work
+
+1. **DB-H1** — wrap the terminal move/resign path in one transaction (one-line
+   change, stops silent points corruption).
+2. **DB-H2** — block abandoning an active pvp game (closes the ladder exploit).
+3. **SEC-M1 / SEC-M2** — `helmet` + an `Origin` check on unsafe methods, before
+   relying on `SameSite=None` in production.
+4. **DB-M1** — real migration runner keyed on `user_version` before the next
+   schema change ships.
+5. **DB-M4 / DB-M5** — shutdown checkpoint + `busy_timeout` (both one-liners in
+   `db.ts`).
+6. Everything under Low / Rules / Tests as capacity allows.
+
+---
+
+## Resolution — 2026-09-05 (all High + Medium addressed)
+
+Server suite is now 48 tests (was 42): +4 CSRF-guard cases, +2 abandon-a-ranked-
+game cases; the leaderboard test now asserts masking. `npm test` green;
+`npm run build` (server + client) green; a fresh file-DB boot was smoke-tested
+(helmet headers present, CSRF 403 on a foreign Origin, `SIGTERM` → clean exit);
+an old-schema DB was migrated end-to-end (rows preserved, stale CHECK replaced,
+`user_version` → 1, `foreign_key_check` clean).
+
+| ID | Fix |
+|----|-----|
+| **DB-H1** | `games.ts` — new `saveMoveTxn` / `resignTxn` `db.transaction`s wrap the finishing `UPDATE` **and** `applyPvpResult` as one unit; `/move` and `/resign` call those. A crash can no longer land between "game finished" and "points moved". |
+| **DB-H2** | `games.ts` `hasActivePvpGame(userId)`; `POST /games` returns 409 ("finish or resign your current game first") when the user is in a live pvp game; `challenges.ts` `POST /:id/accept` returns 409 if either the accepter or the challenger is. Belt-and-braces: a new `trg_one_active_game` trigger (see DB-M2) rejects a second active game for any named player at the DB level. |
+| **DB-M1** | `db.ts` — `gamesTableDDL()` factored so the initial create and the rebuild are identical; `runMigrations()` keyed on `PRAGMA user_version`; migration 1 rebuilds `games` via SQLite's supported sequence (`foreign_keys=OFF` → copy → drop → rename → `foreign_key_check`) inside a transaction, replacing any stale `CHECK` set while preserving rows. |
+| **DB-M2** | `trg_one_active_game` `BEFORE INSERT` trigger: `RAISE(ABORT)` if any of `NEW.user_id / white_user_id / black_user_id` already appears in an `active` row. Covers the non-creator side the partial unique index can't express. Single-writer assumption now documented in `db.ts`. |
+| **DB-M3** | `challenges.ts` — the "recently accepted" cutoff is computed in SQL with the *same* `strftime('%Y-%m-%dT%H:%M:%fZ','now',<offset>)` used to store `updated_at`; the JS `new Date().toISOString()` param is gone. No JS/SQL date-format coupling. |
+| **DB-M4** | `db.ts` exports `closeDb()` (`wal_checkpoint(TRUNCATE)` + `close()`); `index.ts` traps `SIGTERM`/`SIGINT`, stops the server, calls it, force-exits after 5 s. |
+| **DB-M5** | `db.ts` `open()` sets `PRAGMA busy_timeout = 5000`. |
+| **SEC-M1** | `app.ts` `csrfGuard`: for non-safe methods, a present `Origin`/`Referer` must equal `config.clientOrigin` or be same-origin as the request host, else 403; requests with neither header (curl, native, tests) pass. Independent of cookie `SameSite`. |
+| **SEC-M2** | `helmet` added (`server` dep) with a CSP tuned for the SPA (`style-src 'unsafe-inline'` for react-chessboard, `img-src data:`), `Cross-Origin-Resource-Policy: cross-origin` (this is a cross-origin API), `upgrade-insecure-requests` only in prod. |
+| **SEC-M3** | `leaderboard.ts` `maskEmail()` — every row except the requester's own is returned as `a•••@e•••.com`; DTO gains `isMe`. `LeaderboardEntry` updated in both `shared.ts` copies; client `Leaderboard`/`Lobby` use `isMe` for the "me" highlight instead of matching on email. Opponent email in a game DTO is left intact (a consented 1:1 pairing). |
+
+**Deploy note:** migration 1 rebuilds the `games` table on first boot of the
+updated server against an existing database. It is transactional and was tested,
+but **back up the SQLite file (`DB_PATH`) before deploying** — or accept the risk
+if the DB is fresh.
+
+Not done (out of scope — Low / Rules / Tests): DB-L1–L6, SEC-L1–L4, R-L1/L2,
+T-1/T-3/T-5. `users.email COLLATE NOCASE` (DB-L2) was added to the canonical DDL
+so *fresh* DBs get it; existing DBs would need another migration.

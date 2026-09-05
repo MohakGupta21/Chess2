@@ -97,7 +97,7 @@ export function Lobby() {
         </div>
 
         <div className="lobby-col">
-          <Leaderboard meEmail={user?.email} />
+          <Leaderboard />
         </div>
       </div>
     </div>

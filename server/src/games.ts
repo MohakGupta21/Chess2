@@ -31,6 +31,17 @@ const findGameFor = db.prepare(
        AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)`,
 );
 const findEmailById = db.prepare("SELECT email FROM users WHERE id = ?");
+const findActivePvpFor = db.prepare(
+  `SELECT 1 FROM games
+     WHERE status = 'active' AND mode = 'pvp'
+       AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)
+     LIMIT 1`,
+);
+
+/** True if the user is currently in an unfinished player-vs-player game. */
+export function hasActivePvpGame(userId: string): boolean {
+  return findActivePvpFor.get({ u: userId }) !== undefined;
+}
 
 const abandonActiveFor = db.prepare(
   `UPDATE games SET status = 'abandoned', updated_at = ${NOW_SQL}
@@ -103,6 +114,42 @@ const applyPvpResult = db.transaction((row: GameRow, result: GameResult) => {
   addPoints.run(POINTS_WIN, winnerId);
   addPoints.run(-POINTS_LOSS, loserId);
   markPointsApplied.run(row.id);
+});
+
+/**
+ * Persist a move and, if it ended the game, move the pvp points — in ONE
+ * transaction, so a crash can't leave a finished game with points unapplied
+ * and no path that ever retries.
+ */
+const saveMoveTxn = db.transaction(
+  (args: {
+    fen: string;
+    moves: string;
+    san: string;
+    rep: string;
+    status: GameStatus;
+    result: GameResult;
+    endReason: EndReason;
+    row: GameRow;
+  }) => {
+    updateGame.run(
+      args.fen,
+      args.moves,
+      args.san,
+      args.rep,
+      args.status,
+      args.result,
+      args.endReason,
+      args.row.id,
+    );
+    if (args.status !== "active") applyPvpResult(args.row, args.result);
+  },
+);
+
+/** Finish a game as a resignation and move the pvp points, in one transaction. */
+const resignTxn = db.transaction((row: GameRow, result: GameResult) => {
+  finishGame.run("resigned", result, "resignation", row.id);
+  applyPvpResult(row, result);
 });
 
 export function getGameForUser(id: string, userId: string): GameRow | undefined {
@@ -188,6 +235,14 @@ gamesRouter.post("/", (req: AuthedRequest, res: Response) => {
   }
 
   const userId = req.user!.id;
+  // Starting a solo game would otherwise abandon an in-progress ranked game
+  // (and skip its points): make the player finish or resign it first.
+  if (hasActivePvpGame(userId)) {
+    res
+      .status(409)
+      .json({ error: "finish or resign your current game first" });
+    return;
+  }
   const userColor: Color = Math.random() < 0.5 ? "w" : "b";
   const id = nanoid();
   createAiGame(userId, id, userColor, repetitionKey(START_FEN));
@@ -270,17 +325,16 @@ gamesRouter.post("/:id/move", (req: AuthedRequest, res: Response) => {
     endReason = "threefold_repetition";
   }
 
-  updateGame.run(
-    pos.fen,
-    JSON.stringify(moves),
-    JSON.stringify(san),
-    JSON.stringify(repCounts),
+  saveMoveTxn({
+    fen: pos.fen,
+    moves: JSON.stringify(moves),
+    san: JSON.stringify(san),
+    rep: JSON.stringify(repCounts),
     status,
     result,
     endReason,
-    row.id,
-  );
-  if (status !== "active") applyPvpResult(row, result);
+    row,
+  });
 
   res.json({ game: toDTO(getGameForUser(row.id, userId) as GameRow, userId) });
 });
@@ -300,8 +354,7 @@ gamesRouter.post("/:id/resign", (req: AuthedRequest, res: Response) => {
 
   const myColor = colorForUser(row, userId) ?? row.user_color;
   const result: GameResult = myColor === "w" ? "0-1" : "1-0";
-  finishGame.run("resigned", result, "resignation", row.id);
-  applyPvpResult(row, result);
+  resignTxn(row, result);
 
   res.json({ game: toDTO(getGameForUser(row.id, userId) as GameRow, userId) });
 });

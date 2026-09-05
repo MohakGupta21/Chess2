@@ -81,6 +81,39 @@ describe("auth", () => {
   });
 });
 
+describe("CSRF origin guard", () => {
+  it("rejects a state-changing request from a foreign Origin", async () => {
+    const res = await request(app)
+      .post("/api/auth/signup")
+      .set("Origin", "https://evil.example")
+      .send({ email: "csrf@example.com", password: "longenough1" })
+      .expect(403);
+    expect(res.body).toEqual({ error: "cross-origin request refused" });
+  });
+
+  it("allows a request from the configured client origin", async () => {
+    await request(app)
+      .post("/api/auth/signup")
+      .set("Origin", "http://localhost:5173")
+      .send({ email: "okorigin@example.com", password: "longenough1" })
+      .expect(201);
+  });
+
+  it("allows a request with no Origin/Referer (non-browser client)", async () => {
+    await request(app)
+      .post("/api/auth/signup")
+      .send({ email: "noorigin@example.com", password: "longenough1" })
+      .expect(201);
+  });
+
+  it("still allows safe methods cross-origin", async () => {
+    await request(app)
+      .get("/api/health")
+      .set("Origin", "https://evil.example")
+      .expect(200);
+  });
+});
+
 describe("games", () => {
   it("creates a game with a random colour and no active game before that", async () => {
     const agent = await signedInAgent();

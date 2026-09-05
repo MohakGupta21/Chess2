@@ -231,6 +231,37 @@ describe("points", () => {
   });
 });
 
+describe("a ranked game cannot be silently abandoned (DB-H2)", () => {
+  it("refuses a new solo game while a pvp game is active, until resigned", async () => {
+    const a = await signIn("h2a@ex.com");
+    const b = await signIn("h2b@ex.com");
+    const gameId = await startPvpGame(a, b);
+
+    const blocked = await a.post("/api/games").expect(409);
+    expect(blocked.body.error).toMatch(/finish or resign/i);
+
+    await a.post(`/api/games/${gameId}/resign`).expect(200);
+    await a.post("/api/games").expect(201); // now allowed
+  });
+
+  it("refuses accepting a challenge while a pvp game is active", async () => {
+    const a = await signIn("h2c@ex.com");
+    const b = await signIn("h2d@ex.com");
+    const c = await signIn("h2e@ex.com");
+    await startPvpGame(a, b);
+
+    const aEmail = (await a.get("/api/auth/me")).body.user.email as string;
+    const ch = await c
+      .post("/api/challenges")
+      .send({ email: aEmail })
+      .expect(201);
+    const res = await a
+      .post(`/api/challenges/${ch.body.challenge.id}/accept`)
+      .expect(409);
+    expect(res.body.error).toMatch(/finish or resign/i);
+  });
+});
+
 describe("leaderboard", () => {
   it("orders players by points, highest first", async () => {
     const a = await signIn("a@ex.com");
@@ -241,6 +272,14 @@ describe("leaderboard", () => {
 
     const lb = await a.get("/api/leaderboard").expect(200);
     expect(lb.body.entries[0].points).toBe(100);
-    expect(lb.body.entries.map((e: { email: string }) => e.email)).toHaveLength(2);
+    expect(lb.body.entries).toHaveLength(2);
+
+    type Entry = { email: string; points: number; isMe: boolean };
+    const entries = lb.body.entries as Entry[];
+    const mine = entries.find((e) => e.isMe)!;
+    const other = entries.find((e) => !e.isMe)!;
+    expect(mine.email).toBe("a@ex.com"); // own row is unmasked
+    expect(other.email).not.toContain("b@ex.com"); // others are masked
+    expect(other.email).toMatch(/•••/);
   });
 });
