@@ -60,14 +60,14 @@ export function Lobby() {
 
       <div className="lobby-layout">
         <div className="lobby-col">
-          <div className="card">
-            <p className="status-sub" style={{ marginBottom: "0.5rem" }}>
-              Play vs. Computer
+          <div className="lobby-hero">
+            <p className="eyebrow">Play vs. Computer</p>
+            <h2>Ready for a game?</h2>
+            <p className="lede">
+              Jump straight into a match against the built-in engine — no waiting
+              for an opponent.
             </p>
-            <p className="status-sub">
-              A quick game against the built-in engine.
-            </p>
-            <div className="actions" style={{ marginTop: "0.75rem" }}>
+            <div className="actions">
               <button
                 className="primary"
                 onClick={() => void playComputer()}
@@ -77,6 +77,9 @@ export function Lobby() {
               </button>
             </div>
             {error && <div className="form-error">{error}</div>}
+            <span className="hero-piece" aria-hidden="true">
+              ♞
+            </span>
           </div>
 
           {hasActiveGame && (

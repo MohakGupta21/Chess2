@@ -1,8 +1,10 @@
+import { useState } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
 import { useAuth } from "../hooks/useAuth";
 import { useGame } from "../hooks/useGame";
 import { BoardView } from "../components/BoardView";
 import { GameStatusBar } from "../components/GameStatusBar";
+import { GameResultOverlay } from "../components/GameResultOverlay";
 import { MoveList } from "../components/MoveList";
 
 export function Play() {
@@ -20,6 +22,14 @@ export function Play() {
     resign,
     retryEngineMove,
   } = useGame();
+
+  // The end-of-game graphic shows once per finished game until dismissed.
+  const [dismissedResultFor, setDismissedResultFor] = useState<string | null>(null);
+  const showResult =
+    !!game &&
+    game.status !== "active" &&
+    game.status !== "abandoned" &&
+    dismissedResultFor !== game.id;
 
   async function handleSignOut() {
     try {
@@ -113,6 +123,22 @@ export function Play() {
             <MoveList san={game.san} />
           </div>
         </div>
+      )}
+
+      {showResult && game && (
+        <GameResultOverlay
+          game={game}
+          onNewGame={
+            game.mode === "ai"
+              ? () => {
+                  setDismissedResultFor(null);
+                  void newGame();
+                }
+              : undefined
+          }
+          onLobby={() => navigate("/")}
+          onClose={() => setDismissedResultFor(game.id)}
+        />
       )}
     </div>
   );
