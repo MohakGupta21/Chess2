@@ -284,8 +284,7 @@ describe("leaderboard", () => {
     const entries = lb.body.entries as Entry[];
     const mine = entries.find((e) => e.isMe)!;
     const other = entries.find((e) => !e.isMe)!;
-    expect(mine.email).toBe("a@ex.com"); // own row is unmasked
-    expect(other.email).not.toContain("b@ex.com"); // others are masked
-    expect(other.email).toMatch(/•••/);
+    expect(mine.email).toBe("a@ex.com");
+    expect(other.email).toBe("b@ex.com"); // full email on every row
   });
 });

@@ -9,24 +9,10 @@ const TOP_PLAYERS = `
    ORDER BY points DESC, created_at ASC
    LIMIT 20`;
 
-/** "alice@example.com" -> "a•••@e•••.com". Enough to recognise your own row,
- *  not enough to harvest addresses off the leaderboard. */
-function maskEmail(email: string): string {
-  const at = email.lastIndexOf("@");
-  if (at <= 0) return "•••";
-  const local = email.slice(0, at);
-  const domain = email.slice(at + 1);
-  const dot = domain.lastIndexOf(".");
-  const host = dot > 0 ? domain.slice(0, dot) : domain;
-  const tld = dot > 0 ? domain.slice(dot) : "";
-  const clip = (s: string) => (s ? `${s[0]}•••` : "•••");
-  return `${clip(local)}@${clip(host)}${tld}`;
-}
-
 export const leaderboardRouter = Router();
 leaderboardRouter.use(requireAuth);
 
-/** Top players by points, highest first. Emails are masked except your own. */
+/** Top players by points, highest first. Full email on every row. */
 leaderboardRouter.get(
   "/",
   wrap(async (req: AuthedRequest, res: Response) => {
@@ -35,7 +21,7 @@ leaderboardRouter.get(
       TOP_PLAYERS,
     );
     const entries: LeaderboardEntry[] = rows.map((r) => ({
-      email: r.id === me ? r.email : maskEmail(r.email),
+      email: r.email,
       points: r.points,
       isMe: r.id === me,
     }));

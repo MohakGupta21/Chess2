@@ -135,7 +135,6 @@ export interface ChallengeResponse {
 }
 
 export interface LeaderboardEntry {
-  /** Masked (e.g. "a•••@e•••.com") for everyone except the requesting user. */
   email: string;
   points: number;
   /** True for the requesting user's own row. */
