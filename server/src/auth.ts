@@ -6,13 +6,7 @@ import { nanoid } from "nanoid";
 import rateLimit from "express-rate-limit";
 import { credentialsSchema, type PublicUser } from "./shared.js";
 import { config } from "./config.js";
-import { db, type UserRow } from "./db.js";
-
-const insertUser = db.prepare(
-  "INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)",
-);
-const findByEmail = db.prepare("SELECT * FROM users WHERE email = ?");
-const findById = db.prepare("SELECT * FROM users WHERE id = ?");
+import { q, q1, type UserRow } from "./db.js";
 
 /**
  * bcrypt only reads the first 72 bytes of its input. Pre-hashing with SHA-256
@@ -44,28 +38,39 @@ export interface AuthedRequest extends Request {
   user?: PublicUser;
 }
 
+/** Resolve the signed-in user from the auth cookie, or null. */
+async function authenticate(req: Request): Promise<PublicUser | null> {
+  const token = req.cookies?.[config.cookieName];
+  if (!token) return null;
+  try {
+    const payload = jwt.verify(token, config.jwtSecret) as { sub?: string };
+    if (!payload.sub) return null;
+    const row = await q1<UserRow>("SELECT * FROM users WHERE id = $1", [
+      payload.sub,
+    ]);
+    if (!row) return null;
+    return { id: row.id, email: row.email, points: row.points };
+  } catch {
+    return null;
+  }
+}
+
+/** Middleware: 401 unless a valid session cookie resolves to a real user. */
 export function requireAuth(
   req: AuthedRequest,
   res: Response,
   next: NextFunction,
 ): void {
-  const token = req.cookies?.[config.cookieName];
-  if (!token) {
-    res.status(401).json({ error: "not authenticated" });
-    return;
-  }
-  try {
-    const payload = jwt.verify(token, config.jwtSecret) as { sub: string };
-    const row = findById.get(payload.sub) as UserRow | undefined;
-    if (!row) {
-      res.status(401).json({ error: "not authenticated" });
-      return;
-    }
-    req.user = { id: row.id, email: row.email, points: row.points };
-    next();
-  } catch {
-    res.status(401).json({ error: "not authenticated" });
-  }
+  authenticate(req)
+    .then((user) => {
+      if (!user) {
+        res.status(401).json({ error: "not authenticated" });
+        return;
+      }
+      req.user = user;
+      next();
+    })
+    .catch(next);
 }
 
 const authLimiter = rateLimit({
@@ -103,12 +108,16 @@ authRouter.post(
     const passwordHash = await bcrypt.hash(prehash(parsed.data.password), 10);
     try {
       const id = nanoid();
-      insertUser.run(id, email, passwordHash);
+      await q("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)", [
+        id,
+        email,
+        passwordHash,
+      ]);
       setAuthCookie(res, id);
       res.status(201).json({ user: { id, email, points: 0 } });
     } catch (e) {
-      // UNIQUE(email) violation — keep the message generic to limit enumeration.
-      if (e instanceof Error && /UNIQUE/i.test(e.message)) {
+      // unique_violation — keep the message generic to limit enumeration.
+      if (e instanceof Error && (e as { code?: string }).code === "23505") {
         res
           .status(409)
           .json({ error: "could not create an account with those details" });
@@ -129,7 +138,10 @@ authRouter.post(
       return;
     }
     const email = parsed.data.email.toLowerCase().trim();
-    const row = findByEmail.get(email) as UserRow | undefined;
+    const row = await q1<UserRow>(
+      "SELECT * FROM users WHERE lower(email) = $1",
+      [email],
+    );
     const ok = await bcrypt.compare(
       prehash(parsed.data.password),
       row?.password_hash ?? DUMMY_HASH,

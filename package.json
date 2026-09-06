@@ -16,7 +16,9 @@
     "dev:client": "npm run dev --workspace client",
     "build": "npm run build --workspace server && npm run build --workspace client",
     "test": "npm run test --workspace server",
-    "start": "npm run start --workspace server"
+    "start": "npm run start --workspace server",
+    "db:up": "docker compose -f server/docker-compose.yml up -d",
+    "db:down": "docker compose -f server/docker-compose.yml down"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

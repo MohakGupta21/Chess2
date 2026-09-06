@@ -743,3 +743,24 @@ if the DB is fresh.
 Not done (out of scope — Low / Rules / Tests): DB-L1–L6, SEC-L1–L4, R-L1/L2,
 T-1/T-3/T-5. `users.email COLLATE NOCASE` (DB-L2) was added to the canonical DDL
 so *fresh* DBs get it; existing DBs would need another migration.
+
+### Superseded — 2026-09-06 (SQLite → PostgreSQL)
+
+The storage layer was moved from `better-sqlite3` to PostgreSQL (`pg`) so data
+survives Render deploys. This subsumes several items above:
+
+- **DB-M1 / DB-M4 / DB-M5** — the SQLite-specific fixes (table-rebuild
+  migration, WAL checkpoint, `busy_timeout`) are gone. `db.ts` now has an async
+  `pg.Pool`, `initDb()` runs `CREATE TABLE IF NOT EXISTS` + a numbered
+  `schema_migrations` runner, `closeDb()` is `pool.end()`. Postgres alters
+  `CHECK`s in place, so no rebuild dance.
+- **DB-M2** — `trg_one_active_game` is now a plpgsql `BEFORE INSERT` trigger
+  (verified: a 2nd active game raises `player already has an active game`). The
+  single-writer caveat is lifted — `numInstances` may exceed 1.
+- **DB-M3** — the accepted-challenge cutoff is now `now() - interval '60
+  seconds'` in SQL; no date strings cross the JS/SQL boundary at all.
+- **DB-L2** — `users` has a `UNIQUE (lower(email))` functional index; sign-in
+  looks up by `lower(email)`.
+- **DB-H1 / DB-H2 / SEC-M1 / SEC-M2 / SEC-M3** — unchanged in behaviour, ported
+  to async `pg` (`withTransaction`, `$n` params). All 48 tests pass against a
+  real Postgres 16; tests now require one (`npm run db:up`).

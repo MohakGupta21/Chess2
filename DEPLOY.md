@@ -15,7 +15,8 @@ is `httpOnly; SameSite=Lax; Secure`
 ([server/src/auth.ts](./server/src/auth.ts#L34-L38)), which works cleanly
 same‑origin over HTTPS with no extra configuration.
 
-No Docker is used anywhere below.
+No Docker is used in any deploy path below. (Docker is only a convenience for
+running Postgres locally for dev/tests — see `server/docker-compose.yml`.)
 
 ---
 
@@ -24,13 +25,13 @@ No Docker is used anywhere below.
 | Requirement | Why |
 |---|---|
 | **Node.js 22 LTS** (built/tested on v22.6) + npm 10 | runtime + build |
-| **A persistent writable directory** | the database is a `better-sqlite3` file on disk ([server/src/db.ts](./server/src/db.ts)); it must survive restarts and redeploys |
+| **A PostgreSQL database** (v14+) | all data lives in Postgres ([server/src/db.ts](./server/src/db.ts)). The server runs its schema/migrations on startup |
 | **HTTPS** (platform TLS or nginx + certbot) | the auth cookie is `Secure` in production, so plain HTTP will not keep you logged in |
-| C toolchain **only if** `npm ci` can't fetch a `better-sqlite3` prebuilt binary | native module. Prebuilds cover Linux x64/arm64 on Node 22, so usually not needed. If it is: `python3`, `make`, `g++` (Debian/Ubuntu: `build-essential`) |
 
-`better-sqlite3` is synchronous and in‑process — fine for a single node, but it
-means you can run **only one instance**. Do not scale to multiple replicas
-without first moving to a networked database.
+No native modules — `pg` is pure JavaScript, so `npm ci` needs no C toolchain and
+any Node 22+ works. The single-writer limitation is gone; you may run more than
+one instance (the "one active game per player" rule is enforced by a DB trigger,
+not by process-level serialisation).
 
 ---
 
@@ -40,10 +41,11 @@ Set these on the server process (defaults from [server/src/config.ts](./server/s
 
 | Var | Required | Set it to | Notes |
 |---|---|---|---|
-| `NODE_ENV` | yes | `production` | enables `Secure` cookie, requires `JWT_SECRET`, `trust proxy` defaults to `loopback` |
+| `NODE_ENV` | yes | `production` | enables `Secure` cookie, requires `JWT_SECRET` and `DATABASE_URL`, `trust proxy` defaults to `loopback` |
 | `JWT_SECRET` | **yes** | 32+ random bytes, e.g. `openssl rand -hex 32` | server **throws on startup** if unset in production. Rotating it logs everyone out |
+| `DATABASE_URL` | **yes** | Postgres connection string, e.g. `postgres://user:pass@host:5432/chess` | server **throws on startup** if unset in production. Schema + migrations run automatically on boot |
+| `DATABASE_SSL` | usually no | `require` or `disable` | auto: off for `localhost`, on otherwise. Most managed Postgres needs TLS (kept on by default); set `disable` only for a local/plaintext DB |
 | `CLIENT_DIST` | yes | absolute path to the built client, e.g. `/srv/chess/client/dist` | without it the server runs API‑only and the site returns 404 |
-| `DB_PATH` | yes | absolute path on the persistent disk, e.g. `/var/lib/chess/chess.sqlite` | parent dir is created automatically; WAL mode is on |
 | `PORT` | no | port to listen on (default `4000`) | many PaaS platforms inject this |
 | `TRUST_PROXY` | if behind a proxy/load balancer | `1` (single proxy hop) or `true` | so the rate limiter keys on the real client IP, not the proxy |
 | `CLIENT_ORIGIN` | only for a split deploy | the client's origin, e.g. `https://chess.example.com` | reflected by CORS so the browser accepts credentialed cross‑origin API calls |
@@ -109,8 +111,8 @@ Run:
 ```bash
 NODE_ENV=production \
 JWT_SECRET=... \
+DATABASE_URL=postgres://user:pass@host:5432/chess \
 CLIENT_DIST="$PWD/client/dist" \
-DB_PATH=/var/lib/chess/chess.sqlite \
 PORT=4000 \
 npm start
 ```
@@ -136,14 +138,16 @@ Full control, no platform lock‑in. ~15 minutes.
 
 ```bash
 # as root / sudo
-apt update && apt install -y curl nginx
+apt update && apt install -y curl nginx postgresql
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt install -y nodejs
-# only if the better-sqlite3 prebuild is missing for your arch:
-# apt install -y build-essential python3
 
 adduser --system --group --home /srv/chess chess
-mkdir -p /var/lib/chess && chown chess:chess /var/lib/chess   # DB lives here
+
+# create the database and a login role
+sudo -u postgres psql -c "CREATE ROLE chess LOGIN PASSWORD 'change-me';"
+sudo -u postgres psql -c "CREATE DATABASE chess OWNER chess;"
+# -> DATABASE_URL = postgres://chess:change-me@localhost:5432/chess
 ```
 
 ### A.2 Get the code and build
@@ -167,10 +171,14 @@ exit
 NODE_ENV=production
 PORT=4000
 JWT_SECRET=paste-the-openssl-rand-hex-32-value
+DATABASE_URL=postgres://chess:change-me@localhost:5432/chess
+DATABASE_SSL=disable
 CLIENT_DIST=/srv/chess/app/client/dist
-DB_PATH=/var/lib/chess/chess.sqlite
 TRUST_PROXY=1
 ```
+
+(`DATABASE_SSL=disable` because Postgres is on the same host over the loopback;
+drop it if your DB is remote and speaks TLS.)
 
 ```bash
 chmod 600 /srv/chess/app/.env.production
@@ -199,7 +207,6 @@ RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/chess
 
 [Install]
 WantedBy=multi-user.target
@@ -258,82 +265,85 @@ systemctl restart chess
 ```
 
 Rollback: `git checkout <previous-sha>`, `npm ci && npm run build`, restart.
-The SQLite schema is created with `CREATE TABLE IF NOT EXISTS` and has no
-destructive migrations, so old code runs against the existing DB.
+Migrations run forward on boot ([server/src/db.ts](./server/src/db.ts),
+`schema_migrations` table) and are additive, so rolling the code back is safe as
+long as you don't roll back across a migration that dropped/renamed something.
 
 ---
 
 ## Option B — Managed platform (Render, Railway, etc.), no Docker
 
-Any platform that runs a **native Node build** (not just containers) and offers a
-**mounted persistent disk** works. Heroku‑style ephemeral filesystems do **not** —
-the SQLite file would be wiped on every restart.
+Any platform that runs a **native Node build** and can give you a **PostgreSQL
+database** works. No disk is needed; ephemeral filesystems are fine now that all
+state is in Postgres.
 
 ### Render (example)
 
 > **Fastest path:** the repo ships a [`render.yaml`](./render.yaml) Blueprint that
-> encodes everything below (single web service serving API + client, disk, env
-> vars, health check, `numInstances: 1`). Render Dashboard → **New → Blueprint**,
-> point it at this repo, deploy. `JWT_SECRET` is auto-generated and kept stable;
-> the manual steps below are the equivalent if you'd rather click through it.
+> encodes everything below — a web service (API + client) **and** a managed
+> `chess-db` Postgres, with `DATABASE_URL` wired between them, env vars, and the
+> health check. Render Dashboard → **New → Blueprint**, point it at this repo,
+> deploy. `JWT_SECRET` is auto-generated and kept stable.
 
-1. **New → Web Service**, connect the repo. Runtime: **Node**.
-   - Node version is pinned to **22.x** via `.node-version` / `engines` (repo
-     root). Do **not** override it with a `NODE_VERSION` env var — Node 24+ has a
-     different native ABI and the `better-sqlite3` prebuild won't load, so the
-     server crashes on startup at `new Database()`.
-2. **Build command:** `npm ci && npm run build`
-3. **Start command:** `npm start`
-4. **Add a Disk:** mount path `/var/data`, ~1 GB.
+1. **New → Postgres.** Note its **Internal Database URL**.
+2. **New → Web Service**, connect the repo. Runtime: **Node**. Any Node 22+ is
+   fine (no native modules).
+3. **Build command:** `npm ci && npm run build`
+4. **Start command:** `npm start` (runs migrations, then listens)
 5. **Environment:**
    - `NODE_ENV=production`
    - `JWT_SECRET=` (generate one; keep it stable)
+   - `DATABASE_URL=` the Postgres Internal Database URL from step 1
    - `CLIENT_DIST=/opt/render/project/src/client/dist` (absolute path to the repo's `client/dist` on the build host — check the platform's project root and adjust)
-   - `DB_PATH=/var/data/chess.sqlite` (on the mounted disk)
    - `TRUST_PROXY=1`
    - `PORT` is provided by the platform; the server already reads it.
 6. **Health check path:** `/api/health`
 7. Deploy. Use the platform's managed TLS domain or attach your own.
 
-Keep the instance count at **1** (single‑writer SQLite).
+Render's Postgres URL already implies TLS; `DATABASE_SSL` can stay unset.
 
 ---
 
 ## 4. Database persistence & backups
 
-- The DB is one file at `DB_PATH`, plus `-wal` / `-shm` siblings while running.
-- **Back it up without stopping the app** using SQLite's online backup:
+- All state is in Postgres. Schema and forward migrations run automatically on
+  every boot ([server/src/db.ts](./server/src/db.ts)); a `schema_migrations`
+  table records what has been applied.
+- **Backups:** use your provider's automated backups (Render, RDS, Neon, … all
+  offer point-in-time or daily snapshots) — turn them on. For a self-managed
+  Postgres, schedule `pg_dump`:
 
   ```bash
-  sqlite3 /var/lib/chess/chess.sqlite ".backup '/var/backups/chess-$(date +%F).sqlite'"
+  pg_dump "$DATABASE_URL" --format=custom --file=/var/backups/chess-$(date +%F).dump
   ```
 
-  (`apt install -y sqlite3`.) Schedule it with cron/systemd‑timer and copy the
-  output off‑box.
-- To restore: stop the service, replace `chess.sqlite` (delete stale `-wal` /
-  `-shm`), start again.
-- Moving hosts = copy the one file to the new `DB_PATH`.
+  and copy the output off-box.
+- **Restore:** `pg_restore --clean --dbname "$DATABASE_URL" chess-YYYY-MM-DD.dump`
+  (stop the service first).
+- **Moving hosts:** `pg_dump` from the old DB, `pg_restore` into the new one,
+  point `DATABASE_URL` at it.
 
 ---
 
 ## 5. Pre‑launch checklist
 
-- [ ] `npm run build` succeeds clean; `npm test` passes.
+- [ ] `npm run build` succeeds clean; `npm test` passes (needs a Postgres — `npm run db:up`).
 - [ ] `JWT_SECRET` set, random, stored somewhere safe, and **stable** across restarts.
+- [ ] `DATABASE_URL` set and reachable; restart the service and confirm accounts/games survive.
 - [ ] `CLIENT_DIST` points at a real `client/dist` (absolute path) — visit `/` and get the app, not a 404.
-- [ ] `DB_PATH` is on the persistent disk; restart the service and confirm accounts/games survive.
 - [ ] Site is served over HTTPS; sign‑in works and the session sticks after a refresh (confirms the `Secure` cookie is reaching the browser).
 - [ ] `TRUST_PROXY` set when behind nginx / a platform LB; sign‑in rate‑limit (5 attempts / 15 min) triggers per‑client, not globally.
 - [ ] `GET /api/health` returns `{"ok":true}` through the public URL.
-- [ ] Backup job for the SQLite file is scheduled and its output lands off the server.
+- [ ] Automated Postgres backups are enabled (provider snapshots or a `pg_dump` cron).
 
 ---
 
 ## 6. Notes & limits
 
-- **Single instance only.** `better-sqlite3` is an in‑process writer; running two
-  copies against the same file will corrupt it. To scale horizontally, port
-  [server/src/db.ts](./server/src/db.ts) to a networked DB (Postgres) first.
+- **Scaling out is OK.** State is in Postgres and the "one active game per
+  player" rule is enforced by a DB trigger, so you can run more than one
+  instance. Watch the Postgres connection count (`pg.Pool` defaults to 10 per
+  instance).
 - **pvp is polling-based** — clients re‑fetch every 1.5–3s. No WebSocket/SSE, so
   no sticky‑session or upgrade config is needed at the proxy.
 - **No email is sent.** Challenges are by account email and surface in‑app only;

@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { fileURLToPath } from "node:url";
 
 const isProd = process.env.NODE_ENV === "production";
 const isTest = process.env.NODE_ENV === "test";
@@ -11,11 +10,27 @@ function intFromEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+/** Postgres connection string. Required in production. */
+function databaseUrl(): string {
+  const raw = process.env.DATABASE_URL;
+  if (raw && raw.trim() !== "") return raw;
+  if (isProd) throw new Error("DATABASE_URL must be set in production");
+  // Local dev / tests default to the docker-compose Postgres.
+  return "postgres://chess:chess@localhost:5433/chess";
+}
+
 /**
- * Default SQLite location, anchored to `server/data/` regardless of the process
- * working directory (this file resolves the same from `src/` and `dist/`).
+ * Whether to use TLS for the Postgres connection. Managed providers (Render,
+ * Neon, …) require it; a local container does not. Auto-off for localhost;
+ * override with `DATABASE_SSL=require` / `disable`.
  */
-const defaultDbPath = fileURLToPath(new URL("../data/chess.sqlite", import.meta.url));
+function databaseSsl(url: string): false | { rejectUnauthorized: boolean } {
+  const flag = process.env.DATABASE_SSL;
+  if (flag === "disable") return false;
+  if (flag === "require") return { rejectUnauthorized: false };
+  const isLocal = /@(localhost|127\.0\.0\.1|\[::1\])[:/]/.test(url);
+  return isLocal ? false : { rejectUnauthorized: false };
+}
 
 /**
  * `trust proxy` value for Express. Needed so `express-rate-limit` keys on the
@@ -31,12 +46,16 @@ function trustProxy(): boolean | string | number {
   return Number.isInteger(n) ? n : raw;
 }
 
+const dbUrl = databaseUrl();
+
 export const config = {
   isProd,
   isTest,
   port: intFromEnv("PORT", 4000),
-  /** Where the SQLite file lives. ":memory:" for tests. */
-  dbPath: process.env.DB_PATH ?? defaultDbPath,
+  /** Postgres connection string. */
+  databaseUrl: dbUrl,
+  /** TLS options for `pg.Pool` (`false` to disable). */
+  databaseSsl: databaseSsl(dbUrl),
   /** JWT signing secret. A random ephemeral secret is used if unset (dev only). */
   jwtSecret:
     process.env.JWT_SECRET ??

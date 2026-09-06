@@ -1,12 +1,18 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import request from "supertest";
 import { createApp } from "./app.js";
-import { db } from "./db.js";
+import { closeDb, initDb, q } from "./db.js";
 
 const app = createApp();
 
-beforeEach(() => {
-  db.exec("DELETE FROM games; DELETE FROM users;");
+beforeAll(async () => {
+  await initDb();
+});
+afterAll(async () => {
+  await closeDb();
+});
+beforeEach(async () => {
+  await q("TRUNCATE users, games, challenges RESTART IDENTITY CASCADE");
 });
 
 async function signedInAgent(email = "player@example.com") {

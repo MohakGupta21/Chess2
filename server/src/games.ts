@@ -13,147 +13,185 @@ import {
   type GameResult,
   type GameStatus,
 } from "./shared.js";
-import { db, NOW_SQL, type GameRow } from "./db.js";
+import {
+  q,
+  q1,
+  withTransaction,
+  type Executor,
+  type GameRow,
+} from "./db.js";
 import { requireAuth, type AuthedRequest } from "./auth.js";
+import { wrap } from "./http.js";
 import { applyUciMove, positionFromFen, repetitionKey } from "./chessRules.js";
 
 // Any game the user takes part in — creator (user_id) or either side of a pvp
-// game. Named params so the same id can be bound three times.
-const findActiveFor = db.prepare(
-  `SELECT * FROM games
-     WHERE status = 'active'
-       AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)
-     ORDER BY created_at DESC LIMIT 1`,
-);
-const findGameFor = db.prepare(
-  `SELECT * FROM games
-     WHERE id = @id
-       AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)`,
-);
-const findEmailById = db.prepare("SELECT email FROM users WHERE id = ?");
-const findActivePvpFor = db.prepare(
-  `SELECT 1 FROM games
-     WHERE status = 'active' AND mode = 'pvp'
-       AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)
-     LIMIT 1`,
-);
+// game. `$1` is bound once and referenced three times.
+const ACTIVE_FOR = `
+  SELECT * FROM games
+   WHERE status = 'active'
+     AND (user_id = $1 OR white_user_id = $1 OR black_user_id = $1)
+   ORDER BY created_at DESC LIMIT 1`;
+const GAME_FOR = `
+  SELECT * FROM games
+   WHERE id = $1
+     AND (user_id = $2 OR white_user_id = $2 OR black_user_id = $2)`;
 
 /** True if the user is currently in an unfinished player-vs-player game. */
-export function hasActivePvpGame(userId: string): boolean {
-  return findActivePvpFor.get({ u: userId }) !== undefined;
+export async function hasActivePvpGame(userId: string): Promise<boolean> {
+  const row = await q1(
+    `SELECT 1 FROM games
+       WHERE status = 'active' AND mode = 'pvp'
+         AND (user_id = $1 OR white_user_id = $1 OR black_user_id = $1)
+       LIMIT 1`,
+    [userId],
+  );
+  return row !== undefined;
 }
 
-const abandonActiveFor = db.prepare(
-  `UPDATE games SET status = 'abandoned', updated_at = ${NOW_SQL}
-     WHERE status = 'active'
-       AND (user_id = @u OR white_user_id = @u OR black_user_id = @u)`,
-);
-const insertGame = db.prepare(
-  "INSERT INTO games (id, user_id, user_color, fen, rep_counts) VALUES (?, ?, ?, ?, ?)",
-);
-const insertPvpGame = db.prepare(
-  `INSERT INTO games
-     (id, user_id, user_color, mode, white_user_id, black_user_id, fen, rep_counts)
-     VALUES (@id, @creator, @creatorColor, 'pvp', @white, @black, @fen, @rep)`,
-);
-const updateGame = db.prepare(
-  `UPDATE games SET fen = ?, moves = ?, san = ?, rep_counts = ?, status = ?,
-     result = ?, end_reason = ?, updated_at = ${NOW_SQL} WHERE id = ?`,
-);
-const finishGame = db.prepare(
-  `UPDATE games SET status = ?, result = ?, end_reason = ?,
-     updated_at = ${NOW_SQL} WHERE id = ?`,
-);
-const addPoints = db.prepare(
-  "UPDATE users SET points = MAX(0, points + ?) WHERE id = ?",
-);
-const markPointsApplied = db.prepare(
-  "UPDATE games SET points_applied = 1 WHERE id = ?",
-);
+async function abandonActiveFor(exec: Executor, userId: string): Promise<void> {
+  await q(
+    `UPDATE games SET status = 'abandoned', updated_at = now()
+       WHERE status = 'active'
+         AND (user_id = $1 OR white_user_id = $1 OR black_user_id = $1)`,
+    [userId],
+    exec,
+  );
+}
+
+async function addPoints(
+  exec: Executor,
+  delta: number,
+  userId: string,
+): Promise<void> {
+  await q(
+    `UPDATE users SET points = GREATEST(0, points + $1) WHERE id = $2`,
+    [delta, userId],
+    exec,
+  );
+}
 
 /** Abandon any active game for the user and create a fresh AI game, atomically. */
-const createAiGame = db.transaction(
-  (userId: string, id: string, color: Color, repKey: string) => {
-    abandonActiveFor.run({ u: userId });
-    insertGame.run(id, userId, color, START_FEN, JSON.stringify({ [repKey]: 1 }));
-  },
-);
+async function createAiGame(
+  userId: string,
+  id: string,
+  color: Color,
+  repKey: string,
+): Promise<void> {
+  await withTransaction(async (tx) => {
+    await abandonActiveFor(tx, userId);
+    await q(
+      `INSERT INTO games (id, user_id, user_color, fen, rep_counts)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [id, userId, color, START_FEN, JSON.stringify({ [repKey]: 1 })],
+      tx,
+    );
+  });
+}
 
 /**
- * Create a pvp game between two users. Both players' prior active games are
- * abandoned first (one active game per account, either mode). Colours are split
- * at random; `user_id` records the creator so owner-scoped queries still work.
+ * Create a pvp game between two users on the given executor (the caller owns the
+ * transaction). Both players' prior active games are abandoned first (one active
+ * game per account, either mode). Colours are split at random; `user_id` records
+ * the creator so owner-scoped queries still work.
  */
-export const createPvpGame = db.transaction(
-  (opts: { gameId: string; creatorId: string; opponentId: string }) => {
-    const creatorWhite = Math.random() < 0.5;
-    abandonActiveFor.run({ u: opts.creatorId });
-    abandonActiveFor.run({ u: opts.opponentId });
-    insertPvpGame.run({
-      id: opts.gameId,
-      creator: opts.creatorId,
-      creatorColor: creatorWhite ? "w" : "b",
-      white: creatorWhite ? opts.creatorId : opts.opponentId,
-      black: creatorWhite ? opts.opponentId : opts.creatorId,
-      fen: START_FEN,
-      rep: JSON.stringify({ [repetitionKey(START_FEN)]: 1 }),
-    });
-  },
-);
+export async function createPvpGame(
+  exec: Executor,
+  opts: { gameId: string; creatorId: string; opponentId: string },
+): Promise<void> {
+  const creatorWhite = Math.random() < 0.5;
+  await abandonActiveFor(exec, opts.creatorId);
+  await abandonActiveFor(exec, opts.opponentId);
+  await q(
+    `INSERT INTO games
+       (id, user_id, user_color, mode, white_user_id, black_user_id, fen, rep_counts)
+     VALUES ($1, $2, $3, 'pvp', $4, $5, $6, $7)`,
+    [
+      opts.gameId,
+      opts.creatorId,
+      creatorWhite ? "w" : "b",
+      creatorWhite ? opts.creatorId : opts.opponentId,
+      creatorWhite ? opts.opponentId : opts.creatorId,
+      START_FEN,
+      JSON.stringify({ [repetitionKey(START_FEN)]: 1 }),
+    ],
+    exec,
+  );
+}
 
 /**
  * Move points for a finished pvp game, exactly once (`points_applied` guard).
- * Draws and stalemates award nothing. Losers are floored at 0 points.
+ * Draws and stalemates award nothing. Losers are floored at 0 points. Runs on
+ * the caller's transaction executor.
  */
-const applyPvpResult = db.transaction((row: GameRow, result: GameResult) => {
+async function applyPvpResult(
+  exec: Executor,
+  row: GameRow,
+  result: GameResult,
+): Promise<void> {
   if (row.mode !== "pvp" || row.points_applied) return;
   if (result !== "1-0" && result !== "0-1") return;
   const winnerId = result === "1-0" ? row.white_user_id : row.black_user_id;
   const loserId = result === "1-0" ? row.black_user_id : row.white_user_id;
   if (!winnerId || !loserId) return;
-  addPoints.run(POINTS_WIN, winnerId);
-  addPoints.run(-POINTS_LOSS, loserId);
-  markPointsApplied.run(row.id);
-});
+  await addPoints(exec, POINTS_WIN, winnerId);
+  await addPoints(exec, -POINTS_LOSS, loserId);
+  await q(`UPDATE games SET points_applied = 1 WHERE id = $1`, [row.id], exec);
+}
 
 /**
  * Persist a move and, if it ended the game, move the pvp points — in ONE
- * transaction, so a crash can't leave a finished game with points unapplied
- * and no path that ever retries.
+ * transaction, so a crash can't leave a finished game with points unapplied and
+ * no path that ever retries.
  */
-const saveMoveTxn = db.transaction(
-  (args: {
-    fen: string;
-    moves: string;
-    san: string;
-    rep: string;
-    status: GameStatus;
-    result: GameResult;
-    endReason: EndReason;
-    row: GameRow;
-  }) => {
-    updateGame.run(
-      args.fen,
-      args.moves,
-      args.san,
-      args.rep,
-      args.status,
-      args.result,
-      args.endReason,
-      args.row.id,
+async function saveMove(args: {
+  fen: string;
+  moves: string;
+  san: string;
+  rep: string;
+  status: GameStatus;
+  result: GameResult;
+  endReason: EndReason;
+  row: GameRow;
+}): Promise<void> {
+  await withTransaction(async (tx) => {
+    await q(
+      `UPDATE games SET fen = $1, moves = $2, san = $3, rep_counts = $4,
+         status = $5, result = $6, end_reason = $7, updated_at = now()
+       WHERE id = $8`,
+      [
+        args.fen,
+        args.moves,
+        args.san,
+        args.rep,
+        args.status,
+        args.result,
+        args.endReason,
+        args.row.id,
+      ],
+      tx,
     );
-    if (args.status !== "active") applyPvpResult(args.row, args.result);
-  },
-);
+    if (args.status !== "active") await applyPvpResult(tx, args.row, args.result);
+  });
+}
 
 /** Finish a game as a resignation and move the pvp points, in one transaction. */
-const resignTxn = db.transaction((row: GameRow, result: GameResult) => {
-  finishGame.run("resigned", result, "resignation", row.id);
-  applyPvpResult(row, result);
-});
+async function resignGame(row: GameRow, result: GameResult): Promise<void> {
+  await withTransaction(async (tx) => {
+    await q(
+      `UPDATE games SET status = 'resigned', result = $1, end_reason = 'resignation',
+         updated_at = now() WHERE id = $2`,
+      [result, row.id],
+      tx,
+    );
+    await applyPvpResult(tx, row, result);
+  });
+}
 
-export function getGameForUser(id: string, userId: string): GameRow | undefined {
-  return findGameFor.get({ id, u: userId }) as GameRow | undefined;
+export async function getGameForUser(
+  id: string,
+  userId: string,
+): Promise<GameRow | undefined> {
+  return q1<GameRow>(GAME_FOR, [id, userId]);
 }
 
 /** The requesting user's colour in this game, or null if they aren't in it. */
@@ -180,7 +218,10 @@ function parseJson<T>(raw: string, fallback: T): T {
  * game; `turn` and `inCheck` are derived from the FEN. `userColor` and
  * `opponent` are relative to `requesterId`.
  */
-export function toDTO(row: GameRow, requesterId: string): GameDTO {
+export async function toDTO(
+  row: GameRow,
+  requesterId: string,
+): Promise<GameDTO> {
   const pos = positionFromFen(row.fen);
   const status = row.status as GameStatus;
   const finished = status !== "active";
@@ -192,7 +233,9 @@ export function toDTO(row: GameRow, requesterId: string): GameDTO {
     userColor = row.white_user_id === requesterId ? "w" : "b";
     const oppId = userColor === "w" ? row.black_user_id : row.white_user_id;
     const oppRow = oppId
-      ? (findEmailById.get(oppId) as { email: string } | undefined)
+      ? await q1<{ email: string }>("SELECT email FROM users WHERE id = $1", [
+          oppId,
+        ])
       : undefined;
     opponent = oppRow ? { email: oppRow.email } : null;
   } else {
@@ -221,140 +264,157 @@ export const gamesRouter = Router();
 gamesRouter.use(requireAuth);
 
 /** Create a fresh AI game; any prior active game for the user is abandoned. */
-gamesRouter.post("/", (req: AuthedRequest, res: Response) => {
-  const parsed = createGameSchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    res.status(400).json({ error: "invalid game options" });
-    return;
-  }
-  if (parsed.data.mode === "pvp") {
-    res
-      .status(400)
-      .json({ error: "start a player game by accepting a challenge" });
-    return;
-  }
-
-  const userId = req.user!.id;
-  // Starting a solo game would otherwise abandon an in-progress ranked game
-  // (and skip its points): make the player finish or resign it first.
-  if (hasActivePvpGame(userId)) {
-    res
-      .status(409)
-      .json({ error: "finish or resign your current game first" });
-    return;
-  }
-  const userColor: Color = Math.random() < 0.5 ? "w" : "b";
-  const id = nanoid();
-  createAiGame(userId, id, userColor, repetitionKey(START_FEN));
-  const row = getGameForUser(id, userId) as GameRow;
-  res.status(201).json({ game: toDTO(row, userId) });
-});
-
-/** The user's active game, or 404. */
-gamesRouter.get("/current", (req: AuthedRequest, res: Response) => {
-  const userId = req.user!.id;
-  const row = findActiveFor.get({ u: userId }) as GameRow | undefined;
-  if (!row) {
-    res.status(404).json({ error: "no active game" });
-    return;
-  }
-  res.json({ game: toDTO(row, userId) });
-});
-
-/** A specific game the user takes part in. */
-gamesRouter.get("/:id", (req: AuthedRequest, res: Response) => {
-  const userId = req.user!.id;
-  const row = getGameForUser(req.params.id, userId);
-  if (!row) {
-    res.status(404).json({ error: "game not found" });
-    return;
-  }
-  res.json({ game: toDTO(row, userId) });
-});
-
-/** Apply one legal move. */
-gamesRouter.post("/:id/move", (req: AuthedRequest, res: Response) => {
-  const userId = req.user!.id;
-  const parsed = moveRequestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: "a valid UCI move is required" });
-    return;
-  }
-  const row = getGameForUser(req.params.id, userId);
-  if (!row) {
-    res.status(404).json({ error: "game not found" });
-    return;
-  }
-  if (row.status !== "active") {
-    res.status(409).json({ error: "game is already over" });
-    return;
-  }
-
-  // In a pvp game a player may only move their own side, on their own turn.
-  // An AI game lets the single client drive both sides.
-  if (row.mode === "pvp") {
-    const myColor = colorForUser(row, userId);
-    if (!myColor || positionFromFen(row.fen).turn !== myColor) {
-      res.status(409).json({ error: "not your turn" });
+gamesRouter.post(
+  "/",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const parsed = createGameSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({ error: "invalid game options" });
       return;
     }
-  }
+    if (parsed.data.mode === "pvp") {
+      res
+        .status(400)
+        .json({ error: "start a player game by accepting a challenge" });
+      return;
+    }
 
-  const applied = applyUciMove(row.fen, parsed.data.uci);
-  if (!applied.ok || !applied.position) {
-    res.status(422).json({ error: applied.error ?? "illegal move" });
-    return;
-  }
-  const pos = applied.position;
+    const userId = req.user!.id;
+    // Starting a solo game would otherwise abandon an in-progress ranked game
+    // (and skip its points): make the player finish or resign it first.
+    if (await hasActivePvpGame(userId)) {
+      res.status(409).json({ error: "finish or resign your current game first" });
+      return;
+    }
+    const userColor: Color = Math.random() < 0.5 ? "w" : "b";
+    const id = nanoid();
+    await createAiGame(userId, id, userColor, repetitionKey(START_FEN));
+    const row = (await getGameForUser(id, userId)) as GameRow;
+    res.status(201).json({ game: await toDTO(row, userId) });
+  }),
+);
 
-  const moves = [...parseJson<string[]>(row.moves, []), parsed.data.uci];
-  const san = [...parseJson<string[]>(row.san, []), applied.san!];
+/** The user's active game, or 404. */
+gamesRouter.get(
+  "/current",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const userId = req.user!.id;
+    const row = await q1<GameRow>(ACTIVE_FOR, [userId]);
+    if (!row) {
+      res.status(404).json({ error: "no active game" });
+      return;
+    }
+    res.json({ game: await toDTO(row, userId) });
+  }),
+);
 
-  // Threefold repetition (RULES.md section 9): count occurrences of the new
-  // position and, on the third, declare the draw.
-  const repCounts = parseJson<Record<string, number>>(row.rep_counts, {});
-  const key = repetitionKey(pos.fen);
-  repCounts[key] = (repCounts[key] ?? 0) + 1;
+/** A specific game the user takes part in. */
+gamesRouter.get(
+  "/:id",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const userId = req.user!.id;
+    const row = await getGameForUser(req.params.id, userId);
+    if (!row) {
+      res.status(404).json({ error: "game not found" });
+      return;
+    }
+    res.json({ game: await toDTO(row, userId) });
+  }),
+);
 
-  let status: GameStatus = pos.status;
-  let result: GameResult = pos.result;
-  let endReason: EndReason = pos.endReason;
-  if (status === "active" && repCounts[key] >= 3) {
-    status = "draw";
-    result = "1/2-1/2";
-    endReason = "threefold_repetition";
-  }
+/** Apply one legal move. */
+gamesRouter.post(
+  "/:id/move",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const userId = req.user!.id;
+    const parsed = moveRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: "a valid UCI move is required" });
+      return;
+    }
+    const row = await getGameForUser(req.params.id, userId);
+    if (!row) {
+      res.status(404).json({ error: "game not found" });
+      return;
+    }
+    if (row.status !== "active") {
+      res.status(409).json({ error: "game is already over" });
+      return;
+    }
 
-  saveMoveTxn({
-    fen: pos.fen,
-    moves: JSON.stringify(moves),
-    san: JSON.stringify(san),
-    rep: JSON.stringify(repCounts),
-    status,
-    result,
-    endReason,
-    row,
-  });
+    // In a pvp game a player may only move their own side, on their own turn.
+    // An AI game lets the single client drive both sides.
+    if (row.mode === "pvp") {
+      const myColor = colorForUser(row, userId);
+      if (!myColor || positionFromFen(row.fen).turn !== myColor) {
+        res.status(409).json({ error: "not your turn" });
+        return;
+      }
+    }
 
-  res.json({ game: toDTO(getGameForUser(row.id, userId) as GameRow, userId) });
-});
+    const applied = applyUciMove(row.fen, parsed.data.uci);
+    if (!applied.ok || !applied.position) {
+      res.status(422).json({ error: applied.error ?? "illegal move" });
+      return;
+    }
+    const pos = applied.position;
+
+    const moves = [...parseJson<string[]>(row.moves, []), parsed.data.uci];
+    const san = [...parseJson<string[]>(row.san, []), applied.san!];
+
+    // Threefold repetition (RULES.md section 9): count occurrences of the new
+    // position and, on the third, declare the draw.
+    const repCounts = parseJson<Record<string, number>>(row.rep_counts, {});
+    const key = repetitionKey(pos.fen);
+    repCounts[key] = (repCounts[key] ?? 0) + 1;
+
+    let status: GameStatus = pos.status;
+    let result: GameResult = pos.result;
+    let endReason: EndReason = pos.endReason;
+    if (status === "active" && repCounts[key] >= 3) {
+      status = "draw";
+      result = "1/2-1/2";
+      endReason = "threefold_repetition";
+    }
+
+    await saveMove({
+      fen: pos.fen,
+      moves: JSON.stringify(moves),
+      san: JSON.stringify(san),
+      rep: JSON.stringify(repCounts),
+      status,
+      result,
+      endReason,
+      row,
+    });
+
+    res.json({
+      game: await toDTO((await getGameForUser(row.id, userId)) as GameRow, userId),
+    });
+  }),
+);
 
 /** Resign the game; the resigning user loses. */
-gamesRouter.post("/:id/resign", (req: AuthedRequest, res: Response) => {
-  const userId = req.user!.id;
-  const row = getGameForUser(req.params.id, userId);
-  if (!row) {
-    res.status(404).json({ error: "game not found" });
-    return;
-  }
-  if (row.status !== "active") {
-    res.json({ game: toDTO(row, userId) });
-    return;
-  }
+gamesRouter.post(
+  "/:id/resign",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const userId = req.user!.id;
+    const row = await getGameForUser(req.params.id, userId);
+    if (!row) {
+      res.status(404).json({ error: "game not found" });
+      return;
+    }
+    if (row.status !== "active") {
+      res.json({ game: await toDTO(row, userId) });
+      return;
+    }
 
-  const myColor = colorForUser(row, userId) ?? row.user_color;
-  const result: GameResult = myColor === "w" ? "0-1" : "1-0";
-  resignTxn(row, result);
+    const myColor = colorForUser(row, userId) ?? row.user_color;
+    const result: GameResult = myColor === "w" ? "0-1" : "1-0";
+    await resignGame(row, result);
 
-  res.json({ game: toDTO(getGameForUser(row.id, userId) as GameRow, userId) });
-});
+    res.json({
+      game: await toDTO((await getGameForUser(row.id, userId)) as GameRow, userId),
+    });
+  }),
+);

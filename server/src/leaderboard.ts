@@ -1,13 +1,13 @@
 import { Router, type Response } from "express";
 import type { LeaderboardEntry } from "./shared.js";
-import { db } from "./db.js";
+import { q } from "./db.js";
 import { requireAuth, type AuthedRequest } from "./auth.js";
+import { wrap } from "./http.js";
 
-const topPlayers = db.prepare(
-  `SELECT id, email, points FROM users
-     ORDER BY points DESC, created_at ASC
-     LIMIT 20`,
-);
+const TOP_PLAYERS = `
+  SELECT id, email, points FROM users
+   ORDER BY points DESC, created_at ASC
+   LIMIT 20`;
 
 /** "alice@example.com" -> "a•••@e•••.com". Enough to recognise your own row,
  *  not enough to harvest addresses off the leaderboard. */
@@ -27,17 +27,18 @@ export const leaderboardRouter = Router();
 leaderboardRouter.use(requireAuth);
 
 /** Top players by points, highest first. Emails are masked except your own. */
-leaderboardRouter.get("/", (req: AuthedRequest, res: Response) => {
-  const me = req.user!.id;
-  const rows = topPlayers.all() as Array<{
-    id: string;
-    email: string;
-    points: number;
-  }>;
-  const entries: LeaderboardEntry[] = rows.map((r) => ({
-    email: r.id === me ? r.email : maskEmail(r.email),
-    points: r.points,
-    isMe: r.id === me,
-  }));
-  res.json({ entries });
-});
+leaderboardRouter.get(
+  "/",
+  wrap(async (req: AuthedRequest, res: Response) => {
+    const me = req.user!.id;
+    const rows = await q<{ id: string; email: string; points: number }>(
+      TOP_PLAYERS,
+    );
+    const entries: LeaderboardEntry[] = rows.map((r) => ({
+      email: r.id === me ? r.email : maskEmail(r.email),
+      points: r.points,
+      isMe: r.id === me,
+    }));
+    res.json({ entries });
+  }),
+);
